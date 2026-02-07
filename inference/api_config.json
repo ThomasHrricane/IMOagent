@@ -1,0 +1,17 @@
+{
+  "providers": {
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "default_model": "qwen/qwen3-30b-a3b-thinking-2507",
+      "description": "OpenRouter API"
+    },
+    "commonstack": {
+      "base_url": "https://api.commonstack.ai/v1",
+      "api_key_env": "COMMONSTACK_API_KEY",
+      "default_model": "moonshotai/kimi-k2.5",
+      "description": "CommonStack API"
+    }
+  },
+  "active_provider": "openrouter"
+}

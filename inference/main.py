@@ -1,6 +1,7 @@
 import json
 import orjson
 import os
+import sys
 
 from math_templates import math_templates
 from utils import hash_problem_idx, read_data, extract_boxed_answers, extract_solution, extract_self_eval
@@ -25,7 +26,7 @@ parser.add_argument("--batch_size", type=int, default=160)
 
 parser.add_argument("--proof_gen_num_processes", type=int, default=40)
 parser.add_argument("--proof_gen_temp", type=float, default=1.0)
-parser.add_argument("--proof_gen_max_len", type=int, default=128 * 1024)
+parser.add_argument("--proof_gen_max_len", type=int, default=32 * 1024)
 parser.add_argument("--proof_gen_template", type=str, default="proof_generation")
 parser.add_argument("--proof_refine_template", type=str, default="proof_refinement")
 parser.add_argument("--n_best_proofs_to_sample", type=int, default=32, help="the number of best proofs to consider for refinements")
@@ -36,7 +37,7 @@ parser.add_argument("--n_parallel_proof_gen", type=int, default=128)
 
 parser.add_argument("--proof_verification_num_processes", type=int, default=320)
 parser.add_argument("--proof_verification_temp", type=float, default=1.0)
-parser.add_argument("--proof_verification_max_len", type=int, default=64 * 1024)
+parser.add_argument("--proof_verification_max_len", type=int, default=32 * 1024)
 parser.add_argument("--proof_verification_template", type=str, default="proof_verification")
 parser.add_argument("--n_verification_per_proof", type=int, default=4)
 
@@ -44,9 +45,15 @@ parser.add_argument("--n_verification_per_proof", type=int, default=4)
 parser.add_argument("--skip_meta_verification", action='store_true')
 parser.add_argument("--meta_verification_num_processes", type=int, default=320)
 parser.add_argument("--meta_verification_temp", type=float, default=1.0)
-parser.add_argument("--meta_verification_max_len", type=int, default=64 * 1024)
+parser.add_argument("--meta_verification_max_len", type=int, default=32 * 1024)
 parser.add_argument("--meta_verification_template", type=str, default="meta_verification")
 parser.add_argument("--n_meta_verification_per_rating", type=int, default=1)
+
+# API configuration
+parser.add_argument("--proof_gen_url", type=str, default="", help="API URL for proof generation (deprecated)")
+parser.add_argument("--proof_rate_url", type=str, default="", help="API URL for proof rating (deprecated)")
+parser.add_argument("--infer_script", type=str, default="generate", help="inference script name")
+parser.add_argument("--model", type=str, default="qwen/qwen3-30b-a3b-thinking-2507", help="Model name to use")
 
 
 parser.add_argument("--start_round", type=int, default=1)
@@ -57,9 +64,6 @@ args, _ = parser.parse_known_args()
 input_paths = args.input_paths
 output_dirname = args.output_dirname
 proof_pool_dirname = args.proof_pool_dirname
-
-proof_gen_url = args.proof_gen_url
-proof_rate_url = args.proof_rate_url
 
 args.proof_gen_with_self_eval = args.proof_gen_template in ['proof_generation']
 
@@ -165,7 +169,10 @@ def _split_jobs(jobs, nsplit):
 def _prepare_proof_agg_tasks(tasks, round_idx=None, proof_pool_dirname=None, use_old_proofs_for_refinement=False, num_trials=16, n_best_proofs_to_sample=6, n_proofs_to_refine=4, max_rating_per_score=4):
     data = []
     trials = []
-    print(f"tasks = {len(tasks[0])}", flush=True)
+    if not tasks:
+        print(f"tasks = 0 (empty)", flush=True)
+        return data, trials
+    print(f"tasks = {len(tasks)}", flush=True)
     for (item, proof2ratings, proof2self_eval, proof2dep_proof_ids) in tasks:
         source_name = item.get('source_name', 'temp_source_name')
         if 'problem_idx' in item:
@@ -219,6 +226,7 @@ def _prepare_proof_agg_tasks(tasks, round_idx=None, proof_pool_dirname=None, use
         if use_old_proofs_for_refinement:
             proof_meanscore_ratings_tuples += old_proof_pool
 
+        # 临时禁用提前终止，以验证完整迭代机制
         if any(record[1] > 0.99999 for record in proof_meanscore_ratings_tuples):
             continue
 
@@ -445,18 +453,22 @@ if __name__ == '__main__':
                 if R == args.max_rounds + 1:
                     break
 
-        n_sample = args.n_parallel_proof_gen if R == 1 else args.n_parallel_proof_gen // args.n_agg_trials
+        # 论文精确配置：R0 生成 N 个，R1+ 生成 N×K 个（通过 K 个任务，每个 N 个样本）
+        n_sample = args.n_best_proofs_to_sample if R == 1 else args.n_parallel_proof_gen // args.n_agg_trials
+        # 获取 generate.py 的绝对路径
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        generate_script = os.path.join(script_dir, f"{args.infer_script}.py")
         proof_gen_cmd = f"""
-    python {args.infer_script}.py \
+    uv run python {generate_script} \
     --input_data_path {proof_gen_input_path} \
     --output_data_path {proof_gen_output_path} \
-    --api_url {proof_gen_url} \
     --batch_size {args.batch_size} \
     --num_processes {args.proof_gen_num_processes} \
     --temperature {args.proof_gen_temp} \
     --top_p 0.95 \
     --max_tokens {args.proof_gen_max_len} \
-    --n {n_sample}
+    --n {n_sample} \
+    --model {args.model}
     """.strip()
         print(proof_gen_cmd, flush=True)
         os.system(proof_gen_cmd)
@@ -478,7 +490,7 @@ if __name__ == '__main__':
             )
 
         proof_verification_cmd = f"""
-    python generate.py \
+    uv run python {generate_script} \
         --input_data_path {proof_verification_input_path} \
         --output_data_path {proof_verification_output_path} \
         --batch_size {args.batch_size} \
@@ -486,7 +498,8 @@ if __name__ == '__main__':
         --temperature {args.proof_verification_temp} \
         --top_p 0.95 \
         --max_tokens {args.proof_verification_max_len} \
-        --n {args.n_verification_per_proof}
+        --n {args.n_verification_per_proof} \
+        --model {args.model}
     """.strip()
         print(proof_verification_cmd, flush=True)
         os.system(proof_verification_cmd)
@@ -509,7 +522,7 @@ if __name__ == '__main__':
                 )
 
             meta_verification_cmd = f"""
-    python generate.py \
+    uv run python {generate_script} \
         --input_data_path {meta_verification_input_path} \
         --output_data_path {meta_verification_output_path} \
         --batch_size {args.batch_size} \
@@ -517,7 +530,8 @@ if __name__ == '__main__':
         --temperature {args.meta_verification_temp} \
         --top_p 0.95 \
         --max_tokens {args.meta_verification_max_len} \
-        --n {args.n_meta_verification_per_rating}
+        --n {args.n_meta_verification_per_rating} \
+        --model {args.model}
     """.strip()
             print(meta_verification_cmd, flush=True)
             os.system(meta_verification_cmd)
